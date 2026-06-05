@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""
+IMU Dead Reckoning — Fixed Version
+Fixes applied:
+  FIX 1: Butterworth filter actually applied sample-by-sample using IIR state
+  FIX 2: Orientation tracked via gyro integration; gravity removed in world frame
+  FIX 3: (Used by NeuromorphicVIOPipeline) EKF state fully utilised — see ekf_fusion.py
+"""
+
+import numpy as np
+from typing import Tuple, Optional, Dict
+from collections import deque
+import logging
+from scipy.signal import butter, lfilter_zi
+
+
+class IMUCalibration:
+    def __init__(self):
+        self.accel_bias    = np.zeros(3)   # m/s²  — sensor offset
+        self.gyro_bias     = np.zeros(3)   # rad/s — sensor offset
+        self.gravity_world = np.array([0.0, 0.0, 9.81])  # gravity in world frame
+
+
+class IMUDeadReckoning:
+    """
+    Streaming IMU dead reckoning.
+
+    Coordinate convention
+    ─────────────────────
+    • Body frame  : fixed to sensor, x/y/z as per datasheet
+    • World frame : x=East, y=North, z=Up  (set at calibration time)
+    • R_bw        : rotation matrix that maps body → world  (3×3)
+      Initialised to align gravity with world-Z during calibration.
+    """
+
+    def __init__(self, sample_rate_hz: float = 100.0):
+        self.logger      = logging.getLogger("IMUDeadReckoning")
+        self.dt          = 1.0 / sample_rate_hz
+        self.sample_rate = sample_rate_hz
+
+        # Navigation state (world frame)
+        self.position    = np.zeros(3)
+        self.velocity    = np.zeros(3)
+        self.R_bw        = np.eye(3)   # body→world rotation, identity until calibrated
+
+        self.calibration  = IMUCalibration()
+        self.is_calibrated = False
+
+        # FIX 1 — IIR filter state (zi keeps history between calls)
+        self._setup_filters()
+
+        # Buffers for ZUPT variance test
+        self.accel_buffer = deque(maxlen=20)
+        self.gyro_buffer  = deque(maxlen=20)
+
+        self.frame_count        = 0
+        self.zero_velocity_events = 0
+
+    # ── Filter setup ─────────────────────────────────────────────────────────
+
+    def _setup_filters(self):
+        """Design Butterworth filters and initialise their IIR state vectors."""
+        self.b_accel, self.a_accel = butter(4, 1.0, fs=self.sample_rate, btype='low')
+        self.b_gyro,  self.a_gyro  = butter(4, 5.0, fs=self.sample_rate, btype='low')
+
+        # lfilter_zi returns the initial condition for a unit-step;
+        # we store one zi per axis (3 axes × 2 sensors).
+        zi_base_a = lfilter_zi(self.b_accel, self.a_accel)  # shape (order,)
+        zi_base_g = lfilter_zi(self.b_gyro,  self.a_gyro)
+
+        # Scale by 0 so filter starts at zero output, not at a step
+        self._zi_accel = [zi_base_a * 0.0 for _ in range(3)]
+        self._zi_gyro  = [zi_base_g * 0.0 for _ in range(3)]
+
+    def _filter_sample(self, raw_3d: np.ndarray,
+                       b, a, zi_list) -> np.ndarray:
+        """
+        FIX 1 — Pass one 3-axis sample through the IIR filter.
+        lfilter on a length-1 array advances the state by exactly one step.
+        """
+        out = np.empty(3)
+        for i in range(3):
+            y, zi_list[i] = __import__('scipy.signal', fromlist=['lfilter']).lfilter(
+                b, a, [raw_3d[i]], zi=zi_list[i]
+            )
+            out[i] = y[0]
+        return out
+
+    # ── Calibration ──────────────────────────────────────────────────────────
+
+    def calibrate_static(self, accel_samples: np.ndarray,
+                         gyro_samples: np.ndarray) -> Dict:
+        """
+        Calibrate using N samples taken while the device is completely still.
+
+        • gyro_bias     = mean gyro  (should be ~0 at rest)
+        • accel_bias    = residual after gravity is removed
+        • R_bw          = rotation that aligns body-frame gravity with world +Z
+                          (so gravity removal works even when sensor is tilted)
+        """
+        # Gyro bias
+        self.calibration.gyro_bias = np.mean(gyro_samples, axis=0)
+
+        # Gravity direction in body frame
+        accel_mean   = np.mean(accel_samples, axis=0)
+        g_body       = accel_mean / np.linalg.norm(accel_mean)   # unit vector
+        g_world      = np.array([0.0, 0.0, 1.0])                 # world +Z
+
+        # FIX 2 — Build initial R_bw so body-gravity maps to world-Z
+        # Using Rodrigues' rotation formula: rotate g_body onto g_world
+        v   = np.cross(g_body, g_world)
+        c   = np.dot(g_body, g_world)
+        if np.linalg.norm(v) < 1e-6:
+            self.R_bw = np.eye(3)  # already aligned
+        else:
+            vx  = np.array([[0, -v[2], v[1]],
+                             [v[2], 0, -v[0]],
+                             [-v[1], v[0], 0]])
+            self.R_bw = np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
+
+        # Gravity in world frame (always [0,0,9.81] after alignment)
+        self.calibration.gravity_world = g_world * 9.81
+
+        # Accel bias = whatever is left after gravity is removed in body frame
+        g_in_body = self.R_bw.T @ self.calibration.gravity_world
+        self.calibration.accel_bias = accel_mean - g_in_body
+
+        # Seed filter zi at the first accel value so it doesn't ring at startup
+        for i in range(3):
+            zi_base = lfilter_zi(self.b_accel, self.a_accel)
+            self._zi_accel[i] = zi_base * (accel_mean[i] - self.calibration.accel_bias[i])
+
+        self.is_calibrated = True
+
+        accel_noise = np.std(accel_samples, axis=0)
+        gyro_noise  = np.std(gyro_samples,  axis=0)
+        return {
+            'accel_bias_mg':       (self.calibration.accel_bias * 1000).tolist(),
+            'accel_bias_magnitude': float(np.linalg.norm(self.calibration.accel_bias) * 1000),
+            'accel_noise_sigma':   (accel_noise * 1000).tolist(),
+            'gyro_bias_dps':       (self.calibration.gyro_bias * 180/np.pi).tolist(),
+            'gyro_noise_sigma':    (gyro_noise * 180/np.pi).tolist(),
+            'initial_R_bw':         self.R_bw.tolist(),
+        }
+
+    # ── ZUPT ─────────────────────────────────────────────────────────────────
+
+    def detect_zero_velocity(self, accel_unbiased: np.ndarray,
+                              gyro_unbiased: np.ndarray) -> bool:
+        self.accel_buffer.append(accel_unbiased.copy())
+        self.gyro_buffer.append(gyro_unbiased.copy())
+        if len(self.accel_buffer) < 10:
+            return False
+        accel_var = np.sum(np.var(np.array(self.accel_buffer), axis=0))
+        gyro_var  = np.sum(np.var(np.array(self.gyro_buffer),  axis=0))
+        is_static = accel_var < 0.001 and gyro_var < 0.0001
+        if is_static:
+            self.zero_velocity_events += 1
+        return is_static
+
+    # ── Main propagate ────────────────────────────────────────────────────────
+
+    def propagate(self, accel_raw: np.ndarray,
+                  gyro_raw: np.ndarray) -> Tuple[np.ndarray, bool]:
+        """
+        Advance state by one IMU sample.
+
+        Steps
+        ─────
+        1. Remove sensor bias
+        2. FIX 1 — apply low-pass IIR filter (state persists between calls)
+        3. FIX 2 — update orientation from gyro, then rotate accel to world frame
+        4. Remove gravity (now in world frame, always [0,0,9.81])
+        5. Integrate velocity and position
+        6. ZUPT — zero velocity if device is stationary
+        """
+        # 1. Bias removal
+        accel_unbiased = accel_raw  - self.calibration.accel_bias
+        gyro_unbiased  = gyro_raw   - self.calibration.gyro_bias
+
+        # 2. FIX 1 — sample-by-sample IIR filter (accel only for integration)
+        accel_filtered = self._filter_sample(accel_unbiased,
+                                             self.b_accel, self.a_accel,
+                                             self._zi_accel)
+        # Gyro filter used for ZUPT variance check; raw gyro used for orientation
+        gyro_filtered  = self._filter_sample(gyro_unbiased,
+                                             self.b_gyro,  self.a_gyro,
+                                             self._zi_gyro)
+
+        # 3. FIX 2 — update orientation using bias-corrected (unfiltered) gyro.
+        # We must NOT use gyro_filtered here: the 5 Hz low-pass attenuates
+        # motion signals at 864 Hz to near-zero, killing the rotation update.
+        # The filter is kept for ZUPT variance detection only.
+        angle = np.linalg.norm(gyro_unbiased) * self.dt
+        if angle > 1e-8:
+            axis = gyro_unbiased / (np.linalg.norm(gyro_unbiased) + 1e-12)
+            # Rodrigues: R_new = R_old * exp(angle * [axis]×)
+            K  = np.array([[0,        -axis[2],  axis[1]],
+                            [axis[2],  0,        -axis[0]],
+                            [-axis[1], axis[0],  0       ]])
+            dR = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+            self.R_bw = self.R_bw @ dR
+            # Re-orthogonalise every step to prevent numerical drift
+            U, _, Vt = np.linalg.svd(self.R_bw)
+            self.R_bw = U @ Vt
+
+        # Rotate filtered accel from body frame → world frame
+        accel_world = self.R_bw @ accel_filtered
+
+        # 4. Remove gravity (world frame — always clean [0,0,9.81])
+        accel_nograv = accel_world - self.calibration.gravity_world
+
+        # 5. Integrate
+        self.velocity += accel_nograv * self.dt
+        self.position += self.velocity  * self.dt
+
+        # 6. ZUPT — use filtered signals for variance stability check
+        is_static = self.detect_zero_velocity(accel_filtered, gyro_filtered)
+        if is_static:
+            self.velocity = np.zeros(3)
+
+        self.frame_count += 1
+        return self.position.copy(), is_static
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def reset(self):
+        self.position  = np.zeros(3)
+        self.velocity  = np.zeros(3)
+        self.R_bw      = np.eye(3)
+        self.zero_velocity_events = 0
+        self.frame_count = 0
+        self._setup_filters()
+
+    def get_statistics(self) -> Dict:
+        return {
+            'frames_processed':     self.frame_count,
+            'zero_velocity_events': self.zero_velocity_events,
+            'is_calibrated':        self.is_calibrated,
+            'calibration': {
+                'accel_bias_mg':  (self.calibration.accel_bias * 1000).tolist(),
+                'gravity_world':   self.calibration.gravity_world.tolist(),
+            }
+        }
+
+
+# ── Batch processor (for offline evaluation / TUM dataset) ───────────────────
+
+from scipy.signal import lfilter
+
+class IMUDeadReckoningBatch:
+    """Offline batch version — processes entire sequence at once."""
+
+    def __init__(self, sample_rate_hz: float = 100.0):
+        self.sample_rate = sample_rate_hz
+        self.dt = 1.0 / sample_rate_hz
+        self.b_accel, self.a_accel = butter(4, 1.0, fs=sample_rate_hz, btype='low')
+
+    def process_trajectory(self, accel_sequence: np.ndarray,
+                            gyro_sequence: np.ndarray,
+                            calibration: Optional[IMUCalibration] = None) -> Dict:
+        N = len(accel_sequence)
+
+        # --- Calibration ---
+        if calibration is None:
+            n_static = min(100, N // 10)
+            calibration = IMUCalibration()
+            calibration.gyro_bias = np.mean(gyro_sequence[:n_static], axis=0)
+
+            accel_mean = np.mean(accel_sequence[:n_static], axis=0)
+            g_body     = accel_mean / np.linalg.norm(accel_mean)
+            g_world    = np.array([0.0, 0.0, 1.0])
+            v = np.cross(g_body, g_world)
+            c = np.dot(g_body, g_world)
+            if np.linalg.norm(v) < 1e-6:
+                R_bw = np.eye(3)
+            else:
+                vx  = np.array([[0, -v[2], v[1]],
+                                  [v[2], 0, -v[0]],
+                                  [-v[1], v[0], 0]])
+                R_bw = np.eye(3) + vx + vx @ vx * (1.0 / (1.0 + c))
+            calibration.gravity_world = g_world * 9.81
+            g_in_body = R_bw.T @ calibration.gravity_world
+            calibration.accel_bias = accel_mean - g_in_body
+        else:
+            R_bw = np.eye(3)
+
+        # --- Filter entire sequence ---
+        accel_unbiased = accel_sequence - calibration.accel_bias
+        accel_filtered = np.array([
+            lfilter(self.b_accel, self.a_accel, accel_unbiased[:, i])
+            for i in range(3)
+        ]).T
+
+        # --- Rotate to world frame and remove gravity ---
+        # (batch: use fixed R_bw — no gyro integration in batch mode for simplicity)
+        accel_world  = (R_bw @ accel_filtered.T).T
+        accel_nograv = accel_world - calibration.gravity_world
+
+        # --- Double integrate ---
+        velocity = np.zeros_like(accel_nograv)
+        position = np.zeros_like(accel_nograv)
+        for i in range(1, N):
+            velocity[i] = velocity[i-1] + accel_nograv[i] * self.dt
+            position[i] = position[i-1] + velocity[i]     * self.dt
+
+        path_length  = float(np.sum(np.linalg.norm(np.diff(position, axis=0), axis=1)))
+        max_dist     = float(np.max(np.linalg.norm(position, axis=1)))
+
+        return {
+            'position': position,
+            'velocity': velocity,
+            'statistics': {
+                'path_length':            path_length,
+                'final_position':         position[-1].tolist(),
+                'max_distance_from_origin': max_dist,
+                'calibration': {
+                    'accel_bias_mg':  (calibration.accel_bias * 1000).tolist(),
+                    'gravity_world':   calibration.gravity_world.tolist(),
+                }
+            }
+        }
+    
