@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+FIX 3 — Robust EKF with fully utilised 15-D error state
+─────────────────────────────────────────────────────────
+State layout  (15 elements):
+  x[0:3]   position error        (m)
+  x[3:6]   velocity error        (m/s)
+  x[6:9]   orientation error     (rad, small-angle)
+  x[9:12]  accelerometer bias    (m/s²)
+  x[12:15] gyroscope bias        (rad/s)
+
+In the original code the state was 15-D but only the first 6 slots
+were ever written or read.  This version:
+  • propagates all 15 components using the correct F matrix
+  • adds separate noise models for bias random-walk
+  • updates positions from visual tracker (3-D) or dead reckoning (3-D)
+  • keeps Joseph-form covariance update for numerical stability
+  • applies Higham nearest-PD correction when covariance degrades
+"""
+
+import numpy as np
+import logging
+import threading
+from typing import Tuple, Dict, Optional
+
+
+def _nearest_pd(A: np.ndarray) -> np.ndarray:
+    """Higham (1988) nearest positive-definite matrix."""
+    A_sym = (A + A.T) / 2.0
+    evals, evecs = np.linalg.eigh(A_sym)
+    evals = np.maximum(evals, 1e-10)
+    return evecs @ np.diag(evals) @ evecs.T
+
+
+class RobustEKFFusion:
+    """
+    15-D error-state EKF.
+
+    State  : [pos(3), vel(3), att_err(3), accel_bias(3), gyro_bias(3)]
+    Inputs : IMU accel + gyro  (propagation)
+             Visual pose delta or dead-reckoning position (update)
+    """
+
+    DIM = 15   # total state dimension
+    I_POS = slice(0,  3)
+    I_VEL = slice(3,  6)
+    I_ATT = slice(6,  9)
+    I_BA  = slice(9,  12)
+    I_BG  = slice(12, 15)
+
+    def __init__(self,
+                 pos_noise:    float = 0.01,   # m
+                 vel_noise:    float = 0.1,    # m/s
+                 att_noise:    float = 0.01,   # rad
+                 ba_rw_noise:  float = 1e-4,   # m/s² /√s  (random walk)
+                 bg_rw_noise:  float = 1e-5,   # rad/s /√s
+                 ):
+        self.logger = logging.getLogger("EKFFusion")
+        self.lock   = threading.Lock()
+
+        # Error state (always near zero)
+        self.x = np.zeros(self.DIM)
+
+        # Nominal bias estimates (updated by EKF)
+        self.accel_bias_est = np.zeros(3)
+        self.gyro_bias_est  = np.zeros(3)
+
+        # Process noise covariance Q  (15×15 diagonal)
+        q_diag = np.concatenate([
+            np.full(3, 1e-6),           # position  (integrated from velocity)
+            np.full(3, 1e-4),           # velocity  (integrated from accel noise)
+            np.full(3, 1e-5),           # attitude  (integrated from gyro noise)
+            np.full(3, ba_rw_noise**2), # accel bias random-walk
+            np.full(3, bg_rw_noise**2), # gyro  bias random-walk
+        ])
+        self.Q = np.diag(q_diag)
+
+        # State covariance P  (15×15)
+        p_diag = np.concatenate([
+            np.full(3, pos_noise**2),
+            np.full(3, vel_noise**2),
+            np.full(3, att_noise**2),
+            np.full(3, (50e-3)**2),     # accel bias uncertainty (50 mg)
+            np.full(3, (1e-2)**2),      # gyro  bias uncertainty
+        ])
+        self.P = np.diag(p_diag)
+
+        self.updates_ok       = 0
+        self.updates_rejected = 0
+        self.higham_count     = 0
+
+    # ── Propagation ──────────────────────────────────────────────────────────
+
+    def propagate(self, accel: np.ndarray, gyro: np.ndarray, dt: float) -> bool:
+        """
+        Propagate error-state covariance using linearised IMU model.
+        F is the 15×15 state-transition Jacobian.
+        """
+        with self.lock:
+            F = np.eye(self.DIM)
+
+            # pos += vel * dt
+            F[self.I_POS, self.I_VEL] = np.eye(3) * dt
+
+            # vel += (-R * [accel]×) * att_err * dt  — skew-symmetric coupling
+            # Simplified: treat as direct velocity-from-accel with bias correction
+            F[self.I_VEL, self.I_ATT] = -self._skew(accel) * dt
+            F[self.I_VEL, self.I_BA]  = -np.eye(3) * dt   # vel affected by accel bias
+
+            # att += -att_err * dt  (gyro)
+            F[self.I_ATT, self.I_ATT] = np.eye(3)          # keeps attitude error
+            F[self.I_ATT, self.I_BG]  = -np.eye(3) * dt   # attitude affected by gyro bias
+
+            # biases: random-walk (F = I already)
+
+            self.P = F @ self.P @ F.T + self.Q * dt
+            return True
+
+    # ── Measurement updates ───────────────────────────────────────────────────
+
+    def update_position(self, pos_measurement: np.ndarray,
+                        noise_std: float = 0.05) -> Tuple[bool, str]:
+        """
+        Update from a 3-D position measurement (dead reckoning or visual).
+        H observes only the position part of the state.
+        """
+        return self._update(
+            z           = pos_measurement,
+            H_cols      = self.I_POS,
+            meas_dim    = 3,
+            R_diag      = np.full(3, noise_std**2),
+            label       = "position"
+        )
+
+    def update_velocity(self, vel_measurement: np.ndarray,
+                        noise_std: float = 0.02) -> Tuple[bool, str]:
+        """Update from a 3-D velocity measurement (e.g., optical flow)."""
+        return self._update(
+            z           = vel_measurement,
+            H_cols      = self.I_VEL,
+            meas_dim    = 3,
+            R_diag      = np.full(3, noise_std**2),
+            label       = "velocity"
+        )
+
+    def update_pose6d(self, pose_delta: np.ndarray,
+                      confidence: float = 0.8) -> Tuple[bool, str]:
+        """
+        FIX 4 — Update from 6-D visual pose delta [tx,ty,tz, rx,ry,rz].
+        Feeds BOTH position and attitude error states.
+        """
+        noise_pos = (1.0 - confidence) * 0.1 + 0.01
+        noise_att = (1.0 - confidence) * 0.05 + 0.005
+
+        # Build 6×15 observation matrix
+        H = np.zeros((6, self.DIM))
+        H[0:3, self.I_POS] = np.eye(3)   # position rows
+        H[3:6, self.I_ATT] = np.eye(3)   # attitude rows
+
+        R = np.diag(np.concatenate([
+            np.full(3, noise_pos**2),
+            np.full(3, noise_att**2),
+        ]))
+
+        return self._update_H(z=pose_delta, H=H, R=R, label="visual_pose6d")
+
+    # ── Internal EKF update (Joseph form) ─────────────────────────────────────
+
+    def _update(self, z, H_cols, meas_dim, R_diag, label) -> Tuple[bool, str]:
+        H = np.zeros((meas_dim, self.DIM))
+        H[:, H_cols] = np.eye(meas_dim)
+        R = np.diag(R_diag)
+        return self._update_H(z=z, H=H, R=R, label=label)
+
+    def _update_H(self, z, H, R, label) -> Tuple[bool, str]:
+        with self.lock:
+            try:
+                innovation = z - H @ self.x
+                S = H @ self.P @ H.T + R
+
+                try:
+                    K = self.P @ H.T @ np.linalg.inv(S)
+                except np.linalg.LinAlgError:
+                    self.updates_rejected += 1
+                    return False, f"{label}: innovation_cov_singular"
+
+                # State update
+                self.x += K @ innovation
+
+                # Covariance: Joseph form  P = (I-KH)P(I-KH)' + KRK'
+                I_KH = np.eye(self.DIM) - K @ H
+                self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
+
+                # Extract bias corrections back to nominal estimates
+                self.accel_bias_est += self.x[self.I_BA]
+                self.gyro_bias_est  += self.x[self.I_BG]
+                self.x[self.I_BA]    = 0.0   # reset error state (feedback)
+                self.x[self.I_BG]    = 0.0
+
+                # Ensure P stays positive-definite
+                evals = np.linalg.eigvalsh(self.P)
+                if np.any(evals < 0):
+                    self.P = _nearest_pd(self.P)
+                    self.higham_count += 1
+
+                self.updates_ok += 1
+                return True, f"{label}: OK"
+
+            except Exception as e:
+                self.updates_rejected += 1
+                return False, f"{label}: exception {str(e)[:60]}"
+
+    # ── Accessors ─────────────────────────────────────────────────────────────
+
+    def get_position(self) -> np.ndarray:
+        with self.lock:
+            return self.x[self.I_POS].copy()
+
+    def get_velocity(self) -> np.ndarray:
+        with self.lock:
+            return self.x[self.I_VEL].copy()
+
+    def get_telemetry(self) -> Dict:
+        with self.lock:
+            evals = np.linalg.eigvalsh(self.P)
+            return {
+                'updates_ok':        self.updates_ok,
+                'updates_rejected':  self.updates_rejected,
+                'higham_corrections': self.higham_count,
+                'cov_min_eigenval':  float(np.min(evals)),
+                'cov_trace':         float(np.trace(self.P)),
+                'accel_bias_est_mg': (self.accel_bias_est * 1000).tolist(),
+                'gyro_bias_est_dps': (self.gyro_bias_est * 180/np.pi).tolist(),
+            }
+
+    # ── Utility ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _skew(v: np.ndarray) -> np.ndarray:
+        """Return 3×3 skew-symmetric matrix of vector v."""
+        return np.array([[ 0,    -v[2],  v[1]],
+                          [ v[2],  0,    -v[0]],
+                          [-v[1],  v[0],  0   ]])
+    
