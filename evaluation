@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+Full Neuromorphic VIO Evaluation — with real RGB images
+Runs on TUM RGB-D freiburg1_xyz dataset locally
+"""
+
+import numpy as np
+import cv2
+import os
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy.signal import butter
+from imu_dead_reckoning import IMUDeadReckoning
+from ekf_fusion import RobustEKFFusion
+from visual_feature_tracker import VisualFeatureTracker
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+DATASET_DIR   = "."          # folder containing rgb/, depth/, *.txt
+N_CALIB       = 100          # IMU samples used for calibration
+IMU_RATE_HZ   = 100.0
+CAMERA_FX     = 517.3        # TUM freiburg1 intrinsics
+CAMERA_FY     = 516.5
+CAMERA_CX     = 318.6
+CAMERA_CY     = 255.3
+
+# ── Loaders ───────────────────────────────────────────────────────────────────
+
+def load_imu(path):
+    data = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith('#') or not line.strip(): continue
+            p = line.split()
+            data.append([float(x) for x in p])
+    return np.array(data)   # (N, 4): timestamp, ax, ay, az
+
+def load_groundtruth(path):
+    data = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith('#') or not line.strip(): continue
+            p = line.split()
+            data.append([float(x) for x in p])
+    return np.array(data)   # (N, 8): t, tx,ty,tz, qx,qy,qz,qw
+
+def load_rgb_list(path):
+    entries = []
+    with open(path) as f:
+        for line in f:
+            if line.startswith('#') or not line.strip(): continue
+            p = line.split()
+            entries.append((float(p[0]), p[1]))
+    return entries   # list of (timestamp, filepath)
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+print("=" * 55)
+print("  Neuromorphic VIO — Full Pipeline with Images")
+print("=" * 55)
+
+# Load all data
+imu_data = load_imu(os.path.join(DATASET_DIR, "accelerometer.txt"))
+gt_data  = load_groundtruth(os.path.join(DATASET_DIR, "groundtruth.txt"))
+rgb_list = load_rgb_list(os.path.join(DATASET_DIR, "rgb.txt"))
+
+print(f"\nLoaded:")
+print(f"  IMU samples : {len(imu_data):,}")
+print(f"  GT  samples : {len(gt_data):,}")
+print(f"  RGB frames  : {len(rgb_list):,}")
+
+# Camera matrix (TUM freiburg1 calibration)
+K = np.array([[CAMERA_FX, 0, CAMERA_CX],
+              [0, CAMERA_FY, CAMERA_CY],
+              [0, 0, 1]], dtype=np.float64)
+
+# Set up components
+imu_timestamps = imu_data[:, 0]
+imu_accel      = imu_data[:, 1:4]
+imu_gyro       = np.zeros((len(imu_data), 3))  # no gyro in this file
+dt_arr = np.diff(imu_timestamps, prepend=imu_timestamps[0])
+dt_arr[0] = dt_arr[1]
+
+dr  = IMUDeadReckoning(sample_rate_hz=IMU_RATE_HZ)
+ekf = RobustEKFFusion()
+vt  = VisualFeatureTracker(n_features=500, camera_matrix=K)
+
+# Calibrate IMU
+print(f"\nCalibrating on first {N_CALIB} IMU samples...")
+cal = dr.calibrate_static(imu_accel[:N_CALIB], imu_gyro[:N_CALIB])
+print(f"  Accel bias magnitude: {cal['accel_bias_magnitude']:.2f} mg")
+
+# ── Run pipeline ──────────────────────────────────────────────────────────────
+
+ekf_positions  = []
+dr_positions   = []
+timestamps_out = []
+visual_updates = 0
+ZUPT_count     = 0
+
+# Convert rgb list to dict for fast timestamp lookup
+rgb_times = np.array([e[0] for e in rgb_list])
+rgb_paths = [e[1] for e in rgb_list]
+
+print(f"\nRunning full pipeline...")
+print(f"  (IMU + camera frames, this may take 30-60 seconds)\n")
+
+last_cam_idx = -1
+
+for i in range(N_CALIB, len(imu_data)):
+    accel = imu_accel[i]
+    gyro  = imu_gyro[i]
+    dt    = float(dt_arr[i])
+    if dt <= 0 or dt > 0.5:
+        dt = 0.01
+    t_imu = imu_timestamps[i]
+
+    # EKF propagation
+    ekf.propagate(accel, gyro, dt)
+
+    # Dead reckoning
+    dr_pos, is_static = dr.propagate(accel, gyro)
+    if is_static:
+        ZUPT_count += 1
+
+    # EKF update from dead reckoning
+    ekf.update_position(dr_pos, noise_std=0.005 if is_static else 0.05)
+
+    # ── Visual update: find nearest camera frame to this IMU timestamp ──
+    cam_idx = int(np.argmin(np.abs(rgb_times - t_imu)))
+    if cam_idx != last_cam_idx:
+        last_cam_idx = cam_idx
+        img_path = os.path.join(DATASET_DIR, rgb_paths[cam_idx])
+
+        if os.path.exists(img_path):
+            frame = cv2.imread(img_path)
+            if frame is not None:
+                vis_result = vt.process_frame(frame, rgb_times[cam_idx])
+
+                # Feed visual pose delta into EKF (FIX 4)
+                if vis_result['motion_success'] and vis_result['matches'] >= 8:
+                    ekf.update_pose6d(vis_result['pose_delta'], confidence=0.7)
+                    visual_updates += 1
+
+    dr_positions.append(dr_pos.copy())
+    ekf_positions.append(ekf.get_position().copy())
+    timestamps_out.append(t_imu)
+
+    # Progress indicator every 1000 steps
+    if (i - N_CALIB) % 1000 == 0:
+        pct = (i - N_CALIB) / (len(imu_data) - N_CALIB) * 100
+        print(f"  {pct:5.1f}%  |  visual updates so far: {visual_updates}")
+
+print(f"\nPipeline complete!")
+print(f"  Visual (camera) updates : {visual_updates}")
+print(f"  ZUPT events             : {ZUPT_count}")
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+ekf_pos_arr = np.array(ekf_positions)
+dr_pos_arr  = np.array(dr_positions)
+t_out       = np.array(timestamps_out)
+
+gt_t   = gt_data[:, 0]
+gt_xyz = gt_data[:, 1:4]
+
+valid_mask = (t_out >= gt_t[0]) & (t_out <= gt_t[-1])
+gt_interp  = np.zeros((len(t_out), 3))
+for k in range(3):
+    gt_interp[valid_mask, k] = np.interp(t_out[valid_mask], gt_t, gt_xyz[:, k])
+
+ekf_valid = ekf_pos_arr[valid_mask] - ekf_pos_arr[valid_mask][0]
+dr_valid  = dr_pos_arr[valid_mask]  - dr_pos_arr[valid_mask][0]
+gt_valid  = gt_interp[valid_mask]   - gt_interp[valid_mask][0]
+T         = t_out[valid_mask]       - t_out[valid_mask][0]
+
+def ate(est, gt):
+    e = np.linalg.norm(est - gt, axis=1)
+    return np.sqrt(np.mean(e**2)), np.mean(e), np.max(e)
+
+ate_ekf_rmse, ate_ekf_mean, ate_ekf_max = ate(ekf_valid, gt_valid)
+ate_dr_rmse,  ate_dr_mean,  ate_dr_max  = ate(dr_valid,  gt_valid)
+
+print("\n" + "=" * 55)
+print("  RESULTS")
+print("=" * 55)
+print(f"  {'Metric':<28} {'Dead Reck':>10} {'EKF+Cam':>10}")
+print("-" * 55)
+print(f"  {'ATE RMSE (m)':<28} {ate_dr_rmse:>10.4f} {ate_ekf_rmse:>10.4f}")
+print(f"  {'ATE Mean (m)':<28} {ate_dr_mean:>10.4f} {ate_ekf_mean:>10.4f}")
+print(f"  {'ATE Max  (m)':<28} {ate_dr_max:>10.4f}  {ate_ekf_max:>10.4f}")
+print(f"  {'Visual updates':<28} {'—':>10} {visual_updates:>10}")
+print("=" * 55)
+
+# ── Plots ─────────────────────────────────────────────────────────────────────
+
+fig = plt.figure(figsize=(16, 10))
+fig.patch.set_facecolor('#0d1117')
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35,
+                        left=0.07, right=0.97, top=0.92, bottom=0.08)
+
+C_GT  = '#00e5ff'
+C_DR  = '#ff6b6b'
+C_EKF = '#69ff47'
+
+# XY trajectory
+ax1 = fig.add_subplot(gs[0:2, 0:2])
+ax1.set_facecolor('#161b22')
+ax1.plot(gt_valid[:,0],  gt_valid[:,1],  color=C_GT,  lw=2.5, label='Ground Truth', zorder=4)
+ax1.plot(ekf_valid[:,0], ekf_valid[:,1], color=C_EKF, lw=1.5, label=f'EKF+Camera (ATE={ate_ekf_rmse:.3f}m)', zorder=3)
+ax1.plot(dr_valid[:,0],  dr_valid[:,1],  color=C_DR,  lw=1.0, label=f'IMU only  (ATE={ate_dr_rmse:.3f}m)', alpha=0.6, zorder=2)
+ax1.scatter([0],[0], color='white', s=100, zorder=5, label='Start')
+ax1.set_xlabel('X (m)', color='white')
+ax1.set_ylabel('Y (m)', color='white')
+ax1.set_title('XY Trajectory — Ground Truth vs EKF+Camera vs IMU-only',
+              color='white', fontsize=11, fontweight='bold')
+ax1.legend(facecolor='#21262d', labelcolor='white', fontsize=9)
+ax1.tick_params(colors='white')
+ax1.spines[:].set_color('#444')
+ax1.set_aspect('equal')
+ax1.grid(True, color='#333', lw=0.5)
+
+# ATE over time
+ax2 = fig.add_subplot(gs[0, 2])
+ax2.set_facecolor('#161b22')
+ax2.plot(T, np.linalg.norm(ekf_valid - gt_valid, axis=1), color=C_EKF, lw=1.4, label='EKF+Cam')
+ax2.plot(T, np.linalg.norm(dr_valid  - gt_valid, axis=1), color=C_DR,  lw=1.0, label='IMU only', alpha=0.7)
+ax2.set_xlabel('Time (s)', color='white')
+ax2.set_ylabel('ATE (m)',  color='white')
+ax2.set_title('Absolute Trajectory Error', color='white', fontsize=10)
+ax2.legend(facecolor='#21262d', labelcolor='white', fontsize=8)
+ax2.tick_params(colors='white')
+ax2.spines[:].set_color('#444')
+ax2.grid(True, color='#333', lw=0.5)
+
+# Z axis
+ax3 = fig.add_subplot(gs[1, 2])
+ax3.set_facecolor('#161b22')
+ax3.plot(T, gt_valid[:,2],  color=C_GT,  lw=2.0, label='GT')
+ax3.plot(T, ekf_valid[:,2], color=C_EKF, lw=1.4, label='EKF+Cam')
+ax3.plot(T, dr_valid[:,2],  color=C_DR,  lw=0.9, label='IMU only', alpha=0.7)
+ax3.set_xlabel('Time (s)', color='white')
+ax3.set_ylabel('Z (m)', color='white')
+ax3.set_title('Height (Z) Comparison', color='white', fontsize=10)
+ax3.legend(facecolor='#21262d', labelcolor='white', fontsize=8)
+ax3.tick_params(colors='white')
+ax3.spines[:].set_color('#444')
+ax3.grid(True, color='#333', lw=0.5)
+
+fig.suptitle('Neuromorphic VIO — Full Pipeline Results (IMU + Camera)',
+             color='white', fontsize=13, fontweight='bold')
+
+output_path = os.path.join(DATASET_DIR, "vio_full_results.png")
+fig.savefig(output_path, dpi=150, bbox_inches='tight',
+            facecolor=fig.get_facecolor())
+plt.show()
+print(f"\nPlot saved to: {output_path}")
