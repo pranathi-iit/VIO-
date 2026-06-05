@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+Neuromorphic VIO Pipeline — Fixed Version
+All 4 bugs corrected:
+  FIX 1 (imu_dead_reckoning.py) : IIR filter applied sample-by-sample
+  FIX 2 (imu_dead_reckoning.py) : Orientation tracked; gravity removed in world frame
+  FIX 3 (ekf_fusion.py)         : Full 15-D state actually propagated and updated
+  FIX 4 (here)                  : Visual pose_delta fed into EKF.update_pose6d()
+"""
+
+import numpy as np
+import logging
+import threading
+import time
+import os
+import collections
+from typing import Tuple, Optional, List, Dict
+from enum import Enum
+
+from imu_dead_reckoning  import IMUDeadReckoning
+from ekf_fusion          import RobustEKFFusion
+from visual_feature_tracker import VisualFeatureTracker
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+class VIOConfig:
+    # Thermal
+    temp_warning_threshold:  float = 75.0
+    temp_critical_threshold: float = 85.0
+
+    # Camera / latency
+    camera_frame_rate: float = 60.0
+    frame_deadline_ms: float = 16.7
+
+    # Neuromorphic
+    hd_cells_count:              int   = 180
+    hd_confidence_floor:         float = 0.3
+    hd_sparsity_min:             float = 0.10
+    hd_sparsity_max:             float = 0.90
+    place_cell_max:              int   = 1000
+    place_cell_allocation_distance: float = 0.30
+    place_cell_merge_distance:   float = 0.10
+    phase_incoherence_threshold: float = 0.15
+
+    # IMU
+    imu_sample_rate_hz: float = 100.0
+    imu_calib_frames:   int   = 100
+
+
+class SystemState(Enum):
+    INITIALIZING = "INITIALIZING"
+    CALIBRATING  = "CALIBRATING"
+    NOMINAL      = "NOMINAL"
+    DEGRADED     = "DEGRADED"
+
+
+# ── Thermal manager (unchanged logic) ─────────────────────────────────────────
+
+class ThermalManager:
+    def __init__(self, config: VIOConfig):
+        self.config = config
+        self.logger = logging.getLogger("Thermal")
+        self.current_temp = 0.0
+        self.target_rate  = config.camera_frame_rate
+        self.lock = threading.Lock()
+
+    def read_cpu_temperature(self) -> float:
+        try:
+            with open('/sys/class/thermal/thermal_zone0/temp') as f:
+                t = int(f.read().strip()) / 1000.0
+                return t if 0 < t < 150 else 90.0
+        except:
+            return 90.0   # worst-case fallback
+
+    def update(self) -> Tuple[float, bool]:
+        with self.lock:
+            self.current_temp = self.read_cpu_temperature()
+            if self.current_temp > self.config.temp_critical_threshold:
+                self.target_rate = 15.0;  return self.target_rate, True
+            elif self.current_temp > self.config.temp_warning_threshold:
+                self.target_rate = 30.0;  return self.target_rate, True
+            else:
+                self.target_rate = self.config.camera_frame_rate
+                return self.target_rate, False
+
+    def get_telemetry(self) -> Dict:
+        with self.lock:
+            return {'temp_c': self.current_temp, 'target_rate_hz': self.target_rate}
+
+
+# ── Timestamp sync (unchanged) ────────────────────────────────────────────────
+
+class TimestampSync:
+    def __init__(self, config: VIOConfig):
+        self.drift_ema = 0.0
+        self.alpha     = 0.1
+        self.glitches  = 0
+        self.lock = threading.Lock()
+
+    def sync(self, t_cam: float, t_imu: float) -> Tuple[float, bool]:
+        with self.lock:
+            offset = t_imu - t_cam
+            self.drift_ema = self.alpha * offset + (1 - self.alpha) * self.drift_ema
+            glitch = abs(offset - self.drift_ema) > 2.5
+            if glitch: self.glitches += 1
+            return t_cam + self.drift_ema, not glitch
+
+
+# ── Place cell memory (unchanged) ─────────────────────────────────────────────
+
+class PlaceCellMemory:
+    def __init__(self, config: VIOConfig):
+        self.config = config
+        self.cells  = {}
+        self.n_alloc = 0
+
+    def update(self, pose: np.ndarray, confidence: float) -> Dict:
+        min_d = min((np.linalg.norm(pose - v['pos']) for v in self.cells.values()),
+                    default=float('inf'))
+        if min_d > self.config.place_cell_allocation_distance:
+            if len(self.cells) < self.config.place_cell_max:
+                self.cells[len(self.cells)] = {'pos': pose.copy(), 'conf': confidence}
+                self.n_alloc += 1
+        return {'count': len(self.cells), 'allocations': self.n_alloc}
+
+
+# ── Neuromorphic watchdog (unchanged) ─────────────────────────────────────────
+
+class NeuromorphicWatchdog:
+    def __init__(self, config: VIOConfig):
+        self.config   = config
+        self.failures = 0
+
+    def monitor(self, hd_cells: np.ndarray, phases: List[float],
+                confidence: float) -> Tuple[bool, str]:
+        sparsity = np.sum(hd_cells > 0.1) / max(len(hd_cells), 1)
+        circ_var = 0.0
+        if len(phases) >= 2:
+            ph = np.array(phases)
+            R  = np.sqrt(np.sum(np.sin(ph))**2 + np.sum(np.cos(ph))**2) / len(ph)
+            circ_var = 1.0 - R
+
+        ok = (sparsity > self.config.hd_sparsity_min and
+              sparsity < self.config.hd_sparsity_max and
+              circ_var < self.config.phase_incoherence_threshold and
+              confidence > self.config.hd_confidence_floor)
+
+        self.failures = 0 if ok else self.failures + 1
+        return ok, "HEALTHY" if ok else f"UNHEALTHY(cv={circ_var:.2f})"
+
+
+# ── Main pipeline ──────────────────────────────────────────────────────────────
+
+class NeuromorphicVIOPipeline:
+    """
+    Complete fixed pipeline.
+
+    Visual data path  (FIX 4):
+    ──────────────────────────
+    camera frame
+        → VisualFeatureTracker.process_frame()   → pose_delta (6-D)
+        → RobustEKFFusion.update_pose6d()         ← actually called now
+
+    IMU data path (FIX 1+2):
+    ─────────────────────────
+    accel + gyro
+        → IMUDeadReckoning.propagate()            ← filter + world-frame gravity
+        → RobustEKFFusion.update_position()       ← EKF position update
+
+    EKF (FIX 3):
+    ────────────
+    15-D state fully propagated each step;
+    bias corrections fed back to IMU dead reckoning.
+    """
+
+    def __init__(self, config: Optional[VIOConfig] = None,
+                 camera_matrix: Optional[np.ndarray] = None):
+        self.config = config or VIOConfig()
+        self.logger = self._make_logger()
+
+        # Sub-systems
+        self.thermal    = ThermalManager(self.config)
+        self.ts_sync    = TimestampSync(self.config)
+        self.dead_reck  = IMUDeadReckoning(self.config.imu_sample_rate_hz)
+        self.ekf        = RobustEKFFusion()
+        self.vis_track  = VisualFeatureTracker(n_features=500,
+                                               camera_matrix=camera_matrix)
+        self.place_mem  = PlaceCellMemory(self.config)
+        self.watchdog   = NeuromorphicWatchdog(self.config)
+
+        # Calibration state
+        self.state         = SystemState.INITIALIZING
+        self.imu_calibrated = False
+        self._cal_accel    = []
+        self._cal_gyro     = []
+
+        self.frame_count = 0
+        self.logger.info("Pipeline initialised (all 4 fixes active)")
+
+    def _make_logger(self) -> logging.Logger:
+        logger = logging.getLogger("VIOPipeline")
+        if not logger.handlers:
+            h = logging.StreamHandler()
+            h.setFormatter(logging.Formatter('%(asctime)s [%(name)s] %(levelname)s: %(message)s'))
+            logger.addHandler(h)
+        logger.setLevel(logging.INFO)
+        return logger
+
+    # ── IMU calibration ───────────────────────────────────────────────────────
+
+    def _try_calibrate(self, accel: np.ndarray, gyro: np.ndarray) -> bool:
+        """Collect samples until we have enough, then calibrate."""
+        if self.imu_calibrated:
+            return True
+        self._cal_accel.append(accel)
+        self._cal_gyro.append(gyro)
+        if len(self._cal_accel) >= self.config.imu_calib_frames:
+            stats = self.dead_reck.calibrate_static(
+                np.array(self._cal_accel),
+                np.array(self._cal_gyro)
+            )
+            self.imu_calibrated = True
+            self.state = SystemState.NOMINAL
+            self.logger.info(f"IMU calibrated — bias magnitude "
+                             f"{stats['accel_bias_magnitude']:.1f} mg")
+        return self.imu_calibrated
+
+    # ── Main frame processor ──────────────────────────────────────────────────
+
+    def process_frame(self,
+                      frame:          np.ndarray,
+                      depth:          np.ndarray,
+                      imu_accel:      np.ndarray,
+                      imu_gyro:       np.ndarray,
+                      t_cam:          float,
+                      t_imu:          float,
+                      hd_cells:       Optional[np.ndarray] = None,
+                      grid_phases:    Optional[List[float]] = None,
+                      neuro_confidence: float = 0.5) -> Dict:
+
+        if hd_cells   is None: hd_cells    = np.zeros(self.config.hd_cells_count)
+        if grid_phases is None: grid_phases = []
+
+        t_start = time.perf_counter()
+        self.frame_count += 1
+
+        out = {
+            'frame_id':    self.frame_count,
+            'status':      'ok',
+            'pose':        np.zeros(3).tolist(),
+            'is_static':   False,
+            'telemetry':   {},
+        }
+
+        # L0 — Thermal
+        rate, throttle = self.thermal.update()
+        out['telemetry']['thermal'] = self.thermal.get_telemetry()
+
+        # L2 — Timestamp
+        t_sync, sync_ok = self.ts_sync.sync(t_cam, t_imu)
+        if not sync_ok:
+            out['status'] = 'sync_unstable'; return out
+
+        # L1 — IMU calibration (first N frames)
+        if not self._try_calibrate(imu_accel, imu_gyro):
+            out['status'] = 'calibrating'
+            self.state = SystemState.CALIBRATING
+            return out
+
+        # ── FIX 3 — EKF propagation (full 15-D) ──
+        dt_imu = 1.0 / self.config.imu_sample_rate_hz
+        self.ekf.propagate(imu_accel, imu_gyro, dt_imu)
+
+        # Apply EKF bias estimates back to dead reckoning
+        self.dead_reck.calibration.accel_bias += self.ekf.accel_bias_est * 0.01
+        self.dead_reck.calibration.gyro_bias  += self.ekf.gyro_bias_est  * 0.01
+
+        # ── FIX 1+2 — Dead reckoning (filtered, world-frame gravity) ──
+        dr_pos, is_static = self.dead_reck.propagate(imu_accel, imu_gyro)
+
+        # ── FIX 3 — EKF update from dead reckoning position ──
+        dr_noise = 0.05 if not is_static else 0.005
+        self.ekf.update_position(dr_pos, noise_std=dr_noise)
+
+        # ── FIX 4 — Visual tracker → EKF ──────────────────────────────
+        vis_result = self.vis_track.process_frame(frame, t_cam)
+        out['telemetry']['visual'] = {
+            'features': vis_result['features'],
+            'matches':  vis_result['matches'],
+            'success':  vis_result['motion_success'],
+        }
+
+        if vis_result['motion_success'] and vis_result['matches'] >= 8:
+            # This is the line that was broken before — pose_delta now
+            # actually reaches the EKF instead of being discarded
+            ok, msg = self.ekf.update_pose6d(
+                vis_result['pose_delta'],
+                confidence=neuro_confidence
+            )
+            out['telemetry']['visual']['ekf_update'] = msg
+
+        # ── L5 — Neuromorphic watchdog ──
+        neuro_ok, neuro_status = self.watchdog.monitor(
+            hd_cells, grid_phases, neuro_confidence)
+        out['telemetry']['watchdog'] = neuro_status
+
+        # ── L5B — Place cell memory ──
+        ekf_pos = self.ekf.get_position()
+        self.place_mem.update(ekf_pos, neuro_confidence)
+
+        # ── Output ──
+        out['pose']      = ekf_pos.tolist()
+        out['is_static'] = bool(is_static)
+        out['telemetry']['ekf']          = self.ekf.get_telemetry()
+        out['telemetry']['dead_reckoning'] = self.dead_reck.get_statistics()
+        out['latency_ms'] = (time.perf_counter() - t_start) * 1000
+
+        self.state = SystemState.NOMINAL if neuro_ok else SystemState.DEGRADED
+        return out
+
+    def reset(self):
+        self.dead_reck.reset()
+        self.imu_calibrated = False
+        self._cal_accel.clear()
+        self._cal_gyro.clear()
+        self.state = SystemState.INITIALIZING
+        self.logger.info("Pipeline reset")
+        
