@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+Visual Feature Tracker — Fixed Version
+FIX 4: pose_delta from ORB visual odometry is now actually returned and
+        consumed by the EKF (update_pose6d) in neuromorphic_vio_pipeline.py
+"""
+
+import numpy as np
+import cv2
+import logging
+import threading
+from typing import Tuple, Optional, List, Dict
+from dataclasses import dataclass, field
+
+
+@dataclass
+class FeatureFrame:
+    frame_id:    int
+    timestamp:   float
+    keypoints:   list
+    descriptors: np.ndarray
+    frame_gray:  np.ndarray
+    pose:        Optional[np.ndarray] = None
+
+
+class ORBFeatureDetector:
+    def __init__(self, n_features: int = 500):
+        self.logger = logging.getLogger("ORBDetector")
+        self.orb    = cv2.ORB_create(nfeatures=n_features)
+        self.frame_id = 0
+
+    def detect_and_compute(self, frame: np.ndarray, timestamp: float) -> FeatureFrame:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        kps, descs = self.orb.detectAndCompute(gray, None)
+        ff = FeatureFrame(
+            frame_id    = self.frame_id,
+            timestamp   = timestamp,
+            keypoints   = kps or [],
+            descriptors = descs if descs is not None else np.empty((0, 32), dtype=np.uint8),
+            frame_gray  = gray,
+        )
+        self.frame_id += 1
+        return ff
+
+
+class FeatureMatcher:
+    def __init__(self):
+        self.logger  = logging.getLogger("FeatureMatcher")
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+    def match_frames(self, f1: FeatureFrame, f2: FeatureFrame,
+                     ratio: float = 0.75) -> Tuple[list, np.ndarray, np.ndarray]:
+        if len(f1.descriptors) == 0 or len(f2.descriptors) == 0:
+            return [], np.empty((0, 2)), np.empty((0, 2))
+
+        raw = self.matcher.knnMatch(f1.descriptors, f2.descriptors, k=2)
+        good = [m for pair in raw if len(pair) == 2
+                for m, n in [pair] if m.distance < ratio * n.distance]
+
+        if not good:
+            return [], np.empty((0, 2)), np.empty((0, 2))
+
+        pts1 = np.float32([f1.keypoints[m.queryIdx].pt for m in good])
+        pts2 = np.float32([f2.keypoints[m.trainIdx].pt for m in good])
+        return good, pts1, pts2
+
+
+class MotionEstimator:
+    def __init__(self, camera_matrix: Optional[np.ndarray] = None):
+        self.logger = logging.getLogger("MotionEstimator")
+        if camera_matrix is None:
+            fx = fy = 382.0; cx, cy = 320.0, 200.0
+            self.K = np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], dtype=np.float64)
+        else:
+            self.K = camera_matrix
+
+    def estimate(self, pts1: np.ndarray,
+                 pts2: np.ndarray) -> Tuple[np.ndarray, bool, str]:
+        """
+        Returns 6-D pose delta [tx, ty, tz, rx, ry, rz] (translation unit-scale).
+        FIX 4: this value is now actually passed to EKF.update_pose6d().
+        """
+        if len(pts1) < 8:
+            return np.zeros(6), False, f"too_few_matches({len(pts1)})"
+        try:
+            E, mask = cv2.findEssentialMat(pts1, pts2, self.K,
+                                           method=cv2.RANSAC,
+                                           prob=0.999, threshold=1.0)
+            if E is None:
+                return np.zeros(6), False, "essential_mat_failed"
+
+            _, R, t, mask2 = cv2.recoverPose(E, pts1, pts2, self.K, mask=mask)
+            rvec, _        = cv2.Rodrigues(R)
+            pose_delta     = np.concatenate([t.flatten(), rvec.flatten()])
+            inliers        = int(mask2.sum())
+            return pose_delta, True, f"ok_inliers={inliers}"
+        except Exception as e:
+            return np.zeros(6), False, f"exception:{str(e)[:40]}"
+
+
+class VisualFeatureTracker:
+    """
+    ORB visual odometry tracker.
+    Call process_frame() each camera frame.
+    The returned pose_delta goes directly to EKF.update_pose6d().
+    """
+
+    def __init__(self, n_features: int = 500,
+                 camera_matrix: Optional[np.ndarray] = None):
+        self.logger    = logging.getLogger("VisualTracker")
+        self.detector  = ORBFeatureDetector(n_features)
+        self.matcher   = FeatureMatcher()
+        self.estimator = MotionEstimator(camera_matrix)
+        self.prev_frame: Optional[FeatureFrame] = None
+        self.frame_count = 0
+        self.lock = threading.Lock()
+
+    def process_frame(self, frame: np.ndarray,
+                      timestamp: float) -> Dict:
+        with self.lock:
+            curr = self.detector.detect_and_compute(frame, timestamp)
+            out  = {
+                'frame_id':        self.frame_count,
+                'features':        len(curr.keypoints),
+                'matches':         0,
+                'pose_delta':      np.zeros(6),
+                'motion_success':  False,
+                'status':          'first_frame' if self.prev_frame is None else '',
+                'inlier_ratio':    0.0,
+            }
+
+            if self.prev_frame is None:
+                self.prev_frame = curr
+                self.frame_count += 1
+                return out
+
+            _, pts1, pts2 = self.matcher.match_frames(self.prev_frame, curr)
+            out['matches'] = len(pts1)
+
+            if len(pts1) >= 8:
+                pose_delta, success, status = self.estimator.estimate(pts1, pts2)
+                out['pose_delta']     = pose_delta
+                out['motion_success'] = success
+                out['status']         = status
+
+            self.prev_frame  = curr
+            self.frame_count += 1
+            return out
+
+    def get_statistics(self) -> Dict:
+        with self.lock:
+            return {
+                'frames_processed': self.frame_count,
+                'prev_features':    len(self.prev_frame.keypoints) if self.prev_frame else 0,
+            }
+        
